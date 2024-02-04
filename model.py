@@ -10,10 +10,28 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+
+@dataclass
+class MemoryRetrievalConfig:
+    bla: int = 1
+
+@dataclass
+class GPTConfig:
+    block_size: int = 1024
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    memory_retrieval_config: Optional[MemoryRetrievalConfig] = None
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -105,15 +123,18 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
-@dataclass
-class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+class BlockWithMemory(Block):
+    def __init__(self, config: GPTConfig):
+        super().__init__(config)
+        self.memory_retriever = nn.Identity() if config.memory_retrieval_config is None else nn.Identity() # TODO
+        # replace last identity with the memory block
+
+    def forward(self, x):
+        print("INSIDE BlockWithMemory")
+        x_with_memory = self.memory_retriever(x)
+        return super().forward(x_with_memory)
+
+
 
 class GPT(nn.Module):
 
@@ -127,7 +148,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([BlockWithMemory(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
