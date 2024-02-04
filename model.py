@@ -10,16 +10,65 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Dict, Any, Tuple
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+@dataclass
+class FixedMemoryRetrievalParams:
+    num_embeddings: int
+    embedding_dim: int
+
+@dataclass
+class FAISSMemoryRetrievalParams:
+    bla: int = 0
+
 
 @dataclass
 class MemoryRetrievalConfig:
-    bla: int = 1
+    memory_retrieval_params: FixedMemoryRetrievalParams | FAISSMemoryRetrievalParams
+
+class BaseMemoryRetriever(nn.Module):
+    def forward(self, x, extra_info:Optional[Dict[Any,Any]] = None) -> Tuple[torch.Tensor, Optional[Dict[Any,Any]]]:
+        raise NotImplementedError()
+
+def get_memory_retriever(config: MemoryRetrievalConfig):
+    if isinstance(config.memory_retrieval_params, FixedMemoryRetrievalParams):
+        return FixedMemoryRetriever(config.memory_retrieval_params)
+    elif isinstance(config.memory_retrieval_params, FAISSMemoryRetrievalParams):
+        return FAISSMemoryRetriever(config.memory_retrieval_params)
+    else:
+        raise ValueError(f"Invalid memory retrieval params: {config.memory_retrieval_params}")
+
+class FixedMemoryRetriever(BaseMemoryRetriever):
+    """
+    With this simple memory retriever, we simply concatenate the fixed memory to the input only once.
+    Also, we set the valid idxs to be the original input sequence, so the loss fits with the targets.
+    """
+    def __init__(self, config: FixedMemoryRetrievalParams):
+        super().__init__()
+        self.memory = nn.Embedding(config.num_embeddings, config.embedding_dim)
+
+    def forward(self, x, extra_info:Optional[Dict[Any,Any]] = None):
+        if extra_info is None or "Added fixed memory" not in extra_info:
+            # concat the fixed memory to the input
+            initial_valid_indices = torch.arange(x.size(1), device=x.device)
+            x = torch.cat([x, self.memory.weight.expand(x.size(0), -1, -1)], dim=1)
+            extra_info = {
+                "Added fixed memory": True,
+                "initial_valid_indices": initial_valid_indices
+            }
+
+        return x, extra_info
+
+class FAISSMemoryRetriever(BaseMemoryRetriever):
+    def __init__(self, config: FAISSMemoryRetrievalParams):
+        super().__init__()
+
+    def forward(self, x, extra_info:Optional[Dict[Any,Any]] = None):
+        raise NotImplementedError()
 
 @dataclass
 class GPTConfig:
@@ -30,7 +79,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    memory_retrieval_config: Optional[MemoryRetrievalConfig] = None
+    memory_retrieval_config: Optional[MemoryRetrievalConfig | FAISSMemoryRetrievalParams] = None
 
 
 class LayerNorm(nn.Module):
@@ -123,17 +172,18 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
-class BlockWithMemory(Block):
-    def __init__(self, config: GPTConfig):
-        super().__init__(config)
-        self.memory_retriever = nn.Identity() if config.memory_retrieval_config is None else nn.Identity() # TODO
-        # replace last identity with the memory block
 
-    def forward(self, x):
-        print("INSIDE BlockWithMemory")
-        x_with_memory = self.memory_retriever(x)
-        return super().forward(x_with_memory)
 
+class BlockWithMemory(nn.Module):
+    def __init__(self, config: GPTConfig, memory_retrieval: Optional[BaseMemoryRetriever] = None):
+        super().__init__()
+        self.block = Block(config)
+        self.memory_retriever = memory_retrieval
+
+    def forward(self, x, extra_info:Optional[Dict[Any,Any]] = None):
+        if self.memory_retriever is not None:
+            x, extra_info = self.memory_retriever(x, extra_info)
+        return self.block(x), extra_info
 
 
 class GPT(nn.Module):
@@ -143,12 +193,12 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-
+        memory_retriever = get_memory_retriever(config.memory_retrieval_config) if config.memory_retrieval_config is not None else None
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([BlockWithMemory(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([BlockWithMemory(config, memory_retriever) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -198,13 +248,18 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        extra_info = None
         for block in self.transformer.h:
-            x = block(x)
+            x, extra_info = block(x, extra_info)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
+            if extra_info is not None and "initial_valid_indices" in extra_info:
+                initial_valid_indices = extra_info["initial_valid_indices"]
+                logits = logits[:, initial_valid_indices, :]
+
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
