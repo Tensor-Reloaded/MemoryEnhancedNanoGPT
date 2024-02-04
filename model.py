@@ -34,6 +34,13 @@ class BaseMemoryRetriever(nn.Module):
     def forward(self, x, extra_info:Optional[Dict[Any,Any]] = None) -> Tuple[torch.Tensor, Optional[Dict[Any,Any]]]:
         raise NotImplementedError()
 
+    def remove_memory_idxs(self, x, extra_info:Optional[Dict[Any,Any]] = None) -> torch.Tensor:
+        # Optionally you can implement custom logic in the derived class
+        if extra_info is not None and "initial_valid_indices" in extra_info:
+            initial_valid_indices = extra_info["initial_valid_indices"]
+            x = x[:, initial_valid_indices, :]
+        return x
+
 def get_memory_retriever(config: MemoryRetrievalConfig):
     if isinstance(config.memory_retrieval_params, FixedMemoryRetrievalParams):
         return FixedMemoryRetriever(config.memory_retrieval_params)
@@ -193,12 +200,12 @@ class GPT(nn.Module):
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-        memory_retriever = get_memory_retriever(config.memory_retrieval_config) if config.memory_retrieval_config is not None else None
+        self.memory_retriever = get_memory_retriever(config.memory_retrieval_config) if config.memory_retrieval_config is not None else None
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([BlockWithMemory(config, memory_retriever) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([BlockWithMemory(config, self.memory_retriever) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -252,14 +259,12 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             x, extra_info = block(x, extra_info)
         x = self.transformer.ln_f(x)
+        if self.memory_retriever is not None:
+            x = self.memory_retriever.remove_memory_idxs(x, extra_info)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            if extra_info is not None and "initial_valid_indices" in extra_info:
-                initial_valid_indices = extra_info["initial_valid_indices"]
-                logits = logits[:, initial_valid_indices, :]
-
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
